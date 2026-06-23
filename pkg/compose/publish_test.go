@@ -694,3 +694,50 @@ services:
 	assert.NilError(t, err)
 	assert.Assert(t, reader != nil)
 }
+
+func Test_applicationImageRefs_dedupAndOrder(t *testing.T) {
+	project := &types.Project{
+		Services: types.Services{
+			"web":     {Name: "web", Image: "nginx"},
+			"web2":    {Name: "web2", Image: "nginx"}, // shares image with web -> deduped
+			"db":      {Name: "db", Image: "docker.io/library/postgres:16"},
+			"metrics": {Name: "metrics", Image: "quay.io/prometheus/prometheus:v2.53.0"},
+		},
+	}
+
+	refs, err := applicationImageRefs(project)
+	assert.NilError(t, err)
+
+	got := make([]string, len(refs))
+	for i, ref := range refs {
+		got[i] = ref.String()
+	}
+
+	want := []string{
+		"docker.io/library/nginx:latest",
+		"docker.io/library/postgres:16",
+		"quay.io/prometheus/prometheus:v2.53.0",
+	}
+	assert.DeepEqual(t, got, want)
+
+	// order must be independent of map iteration order across runs
+	for i := 0; i < 10; i++ {
+		again, err := applicationImageRefs(project)
+		assert.NilError(t, err)
+		stable := make([]string, len(again))
+		for j, ref := range again {
+			stable[j] = ref.String()
+		}
+		assert.DeepEqual(t, stable, want)
+	}
+}
+
+func Test_applicationImageRefs_invalidImage(t *testing.T) {
+	project := &types.Project{
+		Services: types.Services{
+			"bad": {Name: "bad", Image: "INVALID IMAGE REF"},
+		},
+	}
+	_, err := applicationImageRefs(project)
+	assert.Assert(t, err != nil, "expected error for invalid image reference")
+}

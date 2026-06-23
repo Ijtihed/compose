@@ -33,12 +33,14 @@ import (
 	"github.com/DefangLabs/secret-detector/pkg/secrets"
 	"github.com/compose-spec/compose-go/v2/loader"
 	"github.com/compose-spec/compose-go/v2/types"
+	"github.com/containerd/containerd/v2/core/remotes"
 	"github.com/distribution/reference"
 	"github.com/opencontainers/go-digest"
 	"github.com/opencontainers/image-spec/specs-go"
 	v1 "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/sirupsen/logrus"
 	"go.yaml.in/yaml/v4"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/docker/compose/v5/internal/desktop"
 	"github.com/docker/compose/v5/internal/oci"
@@ -52,7 +54,6 @@ func (s *composeService) Publish(ctx context.Context, project *types.Project, re
 	}, "publish", s.events)
 }
 
-//nolint:gocyclo
 func (s *composeService) publish(ctx context.Context, project *types.Project, repository string, options api.PublishOptions) error {
 	project, err := project.WithProfiles([]string{"*"})
 	if err != nil {
@@ -111,18 +112,9 @@ func (s *composeService) publish(ctx context.Context, project *types.Project, re
 		}
 
 		if options.Application {
-			manifests := []v1.Descriptor{}
-			for _, service := range project.Services {
-				ref, err := reference.ParseDockerRef(service.Image)
-				if err != nil {
-					return err
-				}
-
-				manifest, err := oci.Copy(ctx, resolver, ref, named)
-				if err != nil {
-					return err
-				}
-				manifests = append(manifests, manifest)
+			manifests, err := s.copyApplicationImages(ctx, project, resolver, named)
+			if err != nil {
+				return err
 			}
 
 			descriptor.Data = nil
@@ -160,6 +152,56 @@ func (s *composeService) publish(ctx context.Context, project *types.Project, re
 		Status: api.Done,
 	})
 	return nil
+}
+
+// applicationImageRefs returns the deduplicated, deterministically ordered set
+// of image references to copy for an application. Services sharing the same
+// image would otherwise be copied (and listed) more than once.
+func applicationImageRefs(project *types.Project) ([]reference.Named, error) {
+	unique := make(map[string]reference.Named)
+	for _, service := range project.Services {
+		ref, err := reference.ParseDockerRef(service.Image)
+		if err != nil {
+			return nil, err
+		}
+		unique[ref.String()] = ref
+	}
+	refs := make([]reference.Named, 0, len(unique))
+	for _, ref := range unique {
+		refs = append(refs, ref)
+	}
+	slices.SortFunc(refs, func(a, b reference.Named) int {
+		return strings.Compare(a.String(), b.String())
+	})
+	return refs, nil
+}
+
+// copyApplicationImages copies each unique application image into the published
+// artifact concurrently, returning the resulting manifest descriptors in a
+// deterministic order independent of copy completion order.
+func (s *composeService) copyApplicationImages(ctx context.Context, project *types.Project, resolver remotes.Resolver, named reference.Named) ([]v1.Descriptor, error) {
+	refs, err := applicationImageRefs(project)
+	if err != nil {
+		return nil, err
+	}
+
+	manifests := make([]v1.Descriptor, len(refs))
+	eg, ctx := errgroup.WithContext(ctx)
+	eg.SetLimit(s.maxConcurrency)
+	for i, ref := range refs {
+		eg.Go(func() error {
+			manifest, err := oci.Copy(ctx, resolver, ref, named)
+			if err != nil {
+				return err
+			}
+			manifests[i] = manifest
+			return nil
+		})
+	}
+	if err := eg.Wait(); err != nil {
+		return nil, err
+	}
+	return manifests, nil
 }
 
 func (s *composeService) createLayers(ctx context.Context, project *types.Project, options api.PublishOptions) ([]v1.Descriptor, error) {
